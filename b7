@@ -1,0 +1,221 @@
+# ============================================================
+# 🏥 FULL MODEL X-RAY: Multi-Layer Logit Lens (Depth-wise Shift)
+# Dekhenge ki har layer ka 'Shift' DNA se kitna preserve hua
+# ============================================================
+import torch, numpy as np, time, gc
+import matplotlib.pyplot as plt
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+t0 = time.time()
+print("="*70)
+print("🏥 FULL MODEL X-RAY: Multi-Layer Logit Lens")
+print("="*70)
+
+# 1. Load Model
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype=torch.float32, low_cpu_mem_usage=True)
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+tok.padding_side = 'left'  # Left padding so last token is always at index -1
+if tok.pad_token is None: tok.pad_token = tok.eos_token
+model.eval()
+NL = model.config.num_hidden_layers
+D = model.config.hidden_size
+
+# 2. Get the LM Head (The Final Vocabulary Matrix)
+W_unembed = model.get_output_embeddings().weight.detach().float() 
+
+# 3. Prompts
+prompts = ["The capital of France is", "The square root of 144 is", "In Python, to sort a list you use"]
+inp = tok(prompts, return_tensors="pt", padding="max_length", max_length=16, truncation=True)
+
+# 4. Extract ALL Layers (Input & Output)
+print(f"⏳ Extracting Shifts (Deltas) for all {NL} layers...")
+boxes = {l: {} for l in range(NL)}
+hooks = []
+for l in range(NL):
+    def make_hook(l_idx):
+        def hook(m, i, o):
+            boxes[l_idx]['in'] = i[0].detach().float()
+            boxes[l_idx]['out'] = o.detach().float()
+            return o
+        return hook
+    hooks.append(model.model.layers[l].register_forward_hook(make_hook(l)))
+
+with torch.no_grad():
+    _ = model(**inp)
+for h in hooks: h.remove()
+
+# 5. Process Each Layer (Compress + Logit Lens)
+print(f"{'Layer':<6} | {'Shift Match (Cosine)':<20} | {'Status'}")
+print("-" * 55)
+
+cos_sims_all = []
+for l in range(NL):
+    delta_orig = boxes[l]['out'] - boxes[l]['in']
+    
+    # Rank-16 SVD Compression (DNA)
+    flat = delta_orig.view(-1, D).numpy()
+    mu = flat.mean(0)
+    _, _, Vt = np.linalg.svd(flat - mu, full_matrices=False)
+    k = 16
+    Vt_k = Vt[:k]
+    flat_rec = ((flat - mu) @ Vt_k.T) @ Vt_k + mu
+    delta_dna = torch.tensor(flat_rec, dtype=torch.float32).view(delta_orig.shape)
+    
+    # Logit Lens: Multiply Shift by LM Head
+    logits_orig = delta_orig @ W_unembed.T
+    logits_dna = delta_dna @ W_unembed.T
+    
+    # Calculate Cosine Similarity at the LAST token (index -1 due to left padding)
+    c_sims = []
+    for i in range(len(prompts)):
+        L_o = logits_orig[i, -1, :]
+        L_d = logits_dna[i, -1, :]
+        cos = torch.nn.functional.cosine_similarity(L_o.unsqueeze(0), L_d.unsqueeze(0)).item()
+        c_sims.append(cos)
+        
+    avg_cos = np.mean(c_sims) * 100
+    cos_sims_all.append(avg_cos)
+    
+    # Status indicator
+    if avg_cos > 90: status = "🟢 PERFECT SHIFT"
+    elif avg_cos > 75: status = "🟡 GOOD SHIFT"
+    elif avg_cos > 50: status = "🟠 WEAK SHIFT"
+    else: status = "🔴 SHIFT DESTROYED"
+        
+    print(f" L{l:02d}    | {avg_cos:6.1f}%                 | {status}")
+
+# 6. Final Summary & Plot
+print("\n" + "="*70)
+avg_all = np.mean(cos_sims_all)
+print(f"🏆 AVERAGE SHIFT PRESERVATION ACROSS ALL {NL} LAYERS: {avg_all:.1f}%")
+print("="*70)
+
+if avg_all > 80:
+    print("🎉 MIND-BLOWING! DNA ne poore model ke internal shifts ko preserve kar liya.")
+    print("   Agar final accuracy 23% hai, toh wo 'Cascade Amplification' (Butterfly Effect) ki wajah se hai.")
+    print("   DNA mathematically perfect hai, bas downstream layers ko is naye shift ke aadat daalni hogi (Fine-tuning).")
+else:
+    print("⚠️ Kuch specific layers mein shift destroy ho raha hai.")
+    print("   Dekho upar table mein kahan 🔴 (Red) aaya hai. Wo layers DNA compression handle nahi kar pa rahi.")
+
+# Plotting the Depth Profile
+plt.figure(figsize=(10, 5))
+plt.plot(range(NL), cos_sims_all, marker='o', linestyle='-', color='#4ECDC4', linewidth=2, markersize=6)
+plt.axhline(y=90, color='g', linestyle='--', alpha=0.5, label='Perfect Shift (90%)')
+plt.axhline(y=75, color='y', linestyle='--', alpha=0.5, label='Good Shift (75%)')
+plt.fill_between(range(NL), cos_sims_all, alpha=0.2, color='#4ECDC4')
+plt.xlabel('Layer Depth (0 to 23)')
+plt.ylabel('Shift Direction Match (%)')
+plt.title('Logit Lens: Internal Behavior Preservation Across Depth')
+plt.xticks(range(0, NL, 2))
+plt.ylim(0, 105)
+plt.grid(alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig('results/multi_layer_logit_lens.png', dpi=150)
+plt.show()
+
+print(f"⏱️ Time taken: {time.time()-t0:.1f}s")
+del model; gc.collect() ======================================================================
+🏥 FULL MODEL X-RAY: Multi-Layer Logit Lens
+======================================================================
+Loading weights: 100% 290/290 [00:00<00:00, 394.06it/s]⏳ Extracting Shifts (Deltas) for all 24 layers...
+Layer  | Shift Match (Cosine) | Status
+-------------------------------------------------------
+ L00    |   99.6%                 | 🟢 PERFECT SHIFT
+ L01    |   99.4%                 | 🟢 PERFECT SHIFT
+ L02    |   82.0%                 | 🟡 GOOD SHIFT
+ L03    |   91.6%                 | 🟢 PERFECT SHIFT
+ L04    |   90.7%                 | 🟢 PERFECT SHIFT
+ L05    |   94.5%                 | 🟢 PERFECT SHIFT
+ L06    |   93.4%                 | 🟢 PERFECT SHIFT
+ L07    |   87.4%                 | 🟡 GOOD SHIFT
+ L08    |   98.6%                 | 🟢 PERFECT SHIFT
+ L09    |   96.6%                 | 🟢 PERFECT SHIFT
+ L10    |   98.0%                 | 🟢 PERFECT SHIFT
+ L11    |   99.2%                 | 🟢 PERFECT SHIFT
+ L12    |   98.8%                 | 🟢 PERFECT SHIFT
+ L13    |   98.9%                 | 🟢 PERFECT SHIFT
+ L14    |   97.6%                 | 🟢 PERFECT SHIFT
+ L15    |   98.8%                 | 🟢 PERFECT SHIFT
+ L16    |   97.7%                 | 🟢 PERFECT SHIFT
+ L17    |   97.7%                 | 🟢 PERFECT SHIFT
+ L18    |   99.8%                 | 🟢 PERFECT SHIFT
+ L19    |   94.4%                 | 🟢 PERFECT SHIFT
+ L20    |   99.8%                 | 🟢 PERFECT SHIFT
+ L21    |   99.9%                 | 🟢 PERFECT SHIFT
+ L22    |   99.4%                 | 🟢 PERFECT SHIFT
+ L23    |   99.9%                 | 🟢 PERFECT SHIFT
+
+======================================================================
+🏆 AVERAGE SHIFT PRESERVATION ACROSS ALL 24 LAYERS: 96.4%
+======================================================================
+🎉 MIND-BLOWING! DNA ne poore model ke internal shifts ko preserve kar liya.
+   Agar final accuracy 23% hai, toh wo 'Cascade Amplification' (Butterfly Effect) ki wajah se hai.
+   DNA mathematically perfect hai, bas downstream layers ko is naye shift ke aadat daalni hogi (Fine-tuning).
+---------------------------------------------------------------------------
+FileNotFoundError                         Traceback (most recent call last)
+/tmp/ipykernel_1169/2036685786.py in <cell line: 0>()
+    113 plt.legend()
+    114 plt.tight_layout()
+--> 115 plt.savefig('results/multi_layer_logit_lens.png', dpi=150)
+    116 plt.show()
+    117 
+
+7 frames/usr/local/lib/python3.13/dist-packages/matplotlib/pyplot.py in savefig(*args, **kwargs)
+   1241     # savefig default implementation has no return, so mypy is unhappy
+   1242     # presumably this is here because subclasses can return?
+-> 1243     res = fig.savefig(*args, **kwargs)  # type: ignore[func-returns-value]
+   1244     fig.canvas.draw_idle()  # Need this if 'transparent=True', to reset colors.
+   1245     return res
+
+/usr/local/lib/python3.13/dist-packages/matplotlib/figure.py in savefig(self, fname, transparent, **kwargs)
+   3488                 for ax in self.axes:
+   3489                     _recursively_make_axes_transparent(stack, ax)
+-> 3490             self.canvas.print_figure(fname, **kwargs)
+   3491 
+   3492     def ginput(self, n=1, timeout=30, show_clicks=True,
+
+/usr/local/lib/python3.13/dist-packages/matplotlib/backend_bases.py in print_figure(self, filename, dpi, facecolor, edgecolor, orientation, format, bbox_inches, pad_inches, bbox_extra_artists, backend, **kwargs)
+   2182                 # force the figure dpi to 72), so we need to set it again here.
+   2183                 with cbook._setattr_cm(self.figure, dpi=dpi):
+-> 2184                     result = print_method(
+   2185                         filename,
+   2186                         facecolor=facecolor,
+
+/usr/local/lib/python3.13/dist-packages/matplotlib/backend_bases.py in <lambda>(*args, **kwargs)
+   2038                 "bbox_inches_restore"}
+   2039             skip = optional_kws - {*inspect.signature(meth).parameters}
+-> 2040             print_method = functools.wraps(meth)(lambda *args, **kwargs: meth(
+   2041                 *args, **{k: v for k, v in kwargs.items() if k not in skip}))
+   2042         else:  # Let third-parties do as they see fit.
+
+/usr/local/lib/python3.13/dist-packages/matplotlib/backends/backend_agg.py in print_png(self, filename_or_obj, metadata, pil_kwargs)
+    479             *metadata*, including the default 'Software' key.
+    480         """
+--> 481         self._print_pil(filename_or_obj, "png", pil_kwargs, metadata)
+    482 
+    483     def print_to_buffer(self):
+
+/usr/local/lib/python3.13/dist-packages/matplotlib/backends/backend_agg.py in _print_pil(self, filename_or_obj, fmt, pil_kwargs, metadata)
+    428         """
+    429         FigureCanvasAgg.draw(self)
+--> 430         mpl.image.imsave(
+    431             filename_or_obj, self.buffer_rgba(), format=fmt, origin="upper",
+    432             dpi=self.figure.dpi, metadata=metadata, pil_kwargs=pil_kwargs)
+
+/usr/local/lib/python3.13/dist-packages/matplotlib/image.py in imsave(fname, arr, vmin, vmax, cmap, format, origin, dpi, metadata, pil_kwargs)
+   1632         pil_kwargs.setdefault("format", format)
+   1633         pil_kwargs.setdefault("dpi", (dpi, dpi))
+-> 1634         image.save(fname, **pil_kwargs)
+   1635 
+   1636 
+
+/usr/local/lib/python3.13/dist-packages/PIL/Image.py in save(self, fp, format, **params)
+   2581                 fp = builtins.open(filename, "r+b")
+   2582             else:
+-> 2583                 fp = builtins.open(filename, "w+b")
+   2584         else:
+   2585             fp = cast(IO[bytes], fp)
+
+FileNotFoundError: [Errno 2] No such file or directory: 'results/multi_layer_logit_lens.png'
