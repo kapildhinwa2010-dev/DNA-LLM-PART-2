@@ -1,0 +1,719 @@
+# ============================================================
+# 🧭 MISSION 1.18: FULL LAYER-WISE BROADBAND SONAR MAP
+# Ant-bil analogy:
+# - Har layer par known probe/frequency daalo
+# - Har downstream layer par response naapo
+# - Width = gain
+# - Length = response delay/max layer
+# - Breadth = active dimensions
+# - Noise = non-linear residual across scales
+# - Full map save karo for routing-aware DNA
+# ============================================================
+
+import os
+import time
+import gc
+import numpy as np
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# CPU threads
+try:
+    cpu = os.cpu_count() or 1
+    torch.set_num_threads(max(1, cpu - 1))
+except Exception:
+    pass
+
+t0 = time.time()
+print("=" * 80)
+print("🧭 MISSION 1.18: FULL LAYER-WISE BROADBAND SONAR MAP")
+print("=" * 80)
+
+# ------------------------------------------------------------
+# 0. CONFIG
+# ------------------------------------------------------------
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+
+# Prompts = different colored cement / different concept paths
+PROMPTS = [
+    "The capital of France is",
+    "The capital of Japan is",
+    "The capital of Mexico is",
+]
+
+# Number of random coded probes per layer.
+# 4 = balanced. 2 = faster. 8 = better map but slower.
+PROBES_PER_LAYER = 4
+
+# Two amplitudes for non-linearity/noise estimate.
+EPS1 = 1e-2
+EPS2 = 3e-2
+
+# For top active dimensions per response layer.
+TOPK_DIMS = 8
+
+# Relative threshold for counting active response dimensions.
+ACTIVE_REL_THRESH = 0.05
+
+# Probe mode:
+# "coded"  = random broadband probes, practical
+# "basis_subset" = exact one-hot probes on subset dims, more interpretable but slower
+PROBE_MODE = "coded"
+BASIS_SUBSET_DIMS = 16  # used only if PROBE_MODE == "basis_subset"
+
+SAVE_FULL_DELTA = True  # saves full delta tensors as float16 for later map reconstruction
+
+print(f"⚙️ Model: {MODEL_NAME}")
+print(f"⚙️ Prompts: {len(PROMPTS)}")
+print(f"⚙️ Probes/layer: {PROBES_PER_LAYER}")
+print(f"⚙️ Probe mode: {PROBE_MODE}")
+print(f"⚙️ EPS scales: {EPS1}, {EPS2}")
+print(f"⚙️ Save full delta: {SAVE_FULL_DELTA}")
+
+# ------------------------------------------------------------
+# 1. LOAD MODEL
+# ------------------------------------------------------------
+try:
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        dtype=torch.float32,
+        low_cpu_mem_usage=True,
+    )
+except TypeError:
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
+    )
+
+tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+tok.padding_side = "left"
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+
+model.eval()
+
+NL = model.config.num_hidden_layers
+D = model.config.hidden_size
+
+print(f"✅ Model loaded | layers={NL} | hidden_dim={D}")
+
+# ------------------------------------------------------------
+# 2. CREATE PROBES
+# ------------------------------------------------------------
+torch.manual_seed(1234)
+
+if PROBE_MODE == "coded":
+    # Random normalized directions = broadband coded sonar
+    probes = []
+    for l in range(NL):
+        layer_probes = []
+        for _ in range(PROBES_PER_LAYER):
+            u = torch.randn(D, dtype=torch.float32)
+            u = u / u.norm()
+            layer_probes.append(u)
+        probes.append(layer_probes)
+    print("📡 Created random coded probes.")
+
+elif PROBE_MODE == "basis_subset":
+    # Exact one-hot probes on selected dimensions
+    dims = list(range(min(BASIS_SUBSET_DIMS, D)))
+    probes = []
+    for l in range(NL):
+        layer_probes = []
+        for dim in dims:
+            u = torch.zeros(D, dtype=torch.float32)
+            u[dim] = 1.0
+            layer_probes.append(u)
+        probes.append(layer_probes)
+    print(f"📐 Created basis_subset probes on dims: {dims}")
+
+else:
+    raise ValueError("PROBE_MODE must be 'coded' or 'basis_subset'")
+
+actual_probes_per_layer = len(probes[0])
+total_forwards = len(PROMPTS) * NL * actual_probes_per_layer * 2
+print(f" Approx forward passes: {total_forwards}")
+
+# ------------------------------------------------------------
+# 3. BASELINE RUNS
+# ------------------------------------------------------------
+def get_last_hidden_and_logits(ids):
+    with torch.no_grad():
+        out = model(ids, output_hidden_states=True)
+
+    # hidden_states[0] = embedding output
+    # hidden_states[l+1] = output of transformer layer l
+    H = torch.stack(
+        [out.hidden_states[l + 1][0, -1, :].float() for l in range(NL)],
+        dim=0,
+    )  # (NL, D)
+
+    logits = out.logits[0, -1, :].float()  # (vocab,)
+    return H, logits
+
+baselines = []
+
+print("\n🧱 Running baselines...")
+for pi, prompt in enumerate(PROMPTS):
+    ids = tok(prompt, return_tensors="pt").input_ids
+    H_base, logits_base = get_last_hidden_and_logits(ids)
+    top1_base = int(torch.argmax(logits_base).item())
+
+    baselines.append({
+        "prompt": prompt,
+        "ids": ids,
+        "H": H_base,
+        "logits": logits_base,
+        "top1": top1_base,
+    })
+
+    print(f"   [{pi}] '{prompt}' | baseline top1 id={top1_base}")
+
+print(f"✅ Baselines ready ({time.time()-t0:.1f}s)")
+
+# ------------------------------------------------------------
+# 4. PROBE INJECTION HOOKS
+# ------------------------------------------------------------
+PROBE_STATE = {
+    "active_layer": None,
+    "u": None,
+    "eps": EPS1,
+}
+
+def make_pre_hook(l_idx):
+    def hook(module, args):
+        if PROBE_STATE["active_layer"] != l_idx:
+            return None
+
+        # args[0] is hidden_states entering this layer
+        x = args[0].clone()
+
+        # Inject probe only at last token position for speed/locality
+        x[:, -1, :] = x[:, -1, :] + PROBE_STATE["eps"] * PROBE_STATE["u"]
+
+        return (x,) + args[1:]
+    return hook
+
+hooks = [
+    model.model.layers[l].register_forward_pre_hook(make_pre_hook(l))
+    for l in range(NL)
+]
+
+# ------------------------------------------------------------
+# 5. RUN FULL SONAR SWEEP
+# ------------------------------------------------------------
+records = []
+
+print("\n📡 Running full layer-wise sonar sweep...")
+print(f"{'Prompt':<10}{'Layer':<7}{'Probe':<7}{'FinalGain':<12}{'MaxResp':<10}{'Noise':<10}{'Flip'}")
+print("-" * 80)
+
+for pi, base in enumerate(baselines):
+    ids = base["ids"]
+    Hb = base["H"]
+    top1_base = base["top1"]
+
+    # short label
+    words = base["prompt"].split()
+    label = words[-2] if len(words) >= 2 else f"P{pi}"
+
+    for l in range(NL):
+        for pidx, u in enumerate(probes[l]):
+
+            # ---------------- EPS1 ----------------
+            PROBE_STATE["active_layer"] = l
+            PROBE_STATE["u"] = u
+            PROBE_STATE["eps"] = EPS1
+
+            with torch.no_grad():
+                out1 = model(ids, output_hidden_states=True)
+
+            H1 = torch.stack(
+                [out1.hidden_states[m + 1][0, -1, :].float() for m in range(NL)],
+                dim=0,
+            )  # (NL, D)
+
+            delta1 = H1 - Hb  # (NL, D)
+            gain1 = delta1.norm(dim=1) / EPS1  # (NL,)
+
+            # Top active dimensions per response layer
+            delta_abs1 = delta1.abs()
+            top_val1, top_idx1 = torch.topk(delta_abs1, TOPK_DIMS, dim=1)
+
+            # Active breadth: how many response layers/dims matter
+            max_gain1 = float(gain1.max().item())
+            if max_gain1 > 0:
+                active_layer_count = int((gain1 > ACTIVE_REL_THRESH * max_gain1).sum().item())
+            else:
+                active_layer_count = 0
+
+            logits1 = out1.logits[0, -1, :].float()
+            top1_probe1 = int(torch.argmax(logits1).item())
+            flip1 = int(top1_probe1 != top1_base)
+
+            # ---------------- EPS2 ----------------
+            PROBE_STATE["eps"] = EPS2
+
+            with torch.no_grad():
+                out2 = model(ids, output_hidden_states=True)
+
+            H2 = torch.stack(
+                [out2.hidden_states[m + 1][0, -1, :].float() for m in range(NL)],
+                dim=0,
+            )
+
+            delta2 = H2 - Hb
+            gain2 = delta2.norm(dim=1) / EPS2
+
+            # Non-linear residual:
+            # If locally linear: delta2 ≈ (EPS2/EPS1) * delta1
+            expected_delta2 = (EPS2 / EPS1) * delta1
+            nonlinear_residual = (delta2 - expected_delta2).norm(dim=1) / EPS2
+            noise_scalar = float(nonlinear_residual.mean().item())
+
+            # Max response layer = length/delay proxy
+            max_resp_layer = int(torch.argmax(gain1).item())
+            final_gain = float(gain1[-1].item())
+
+            rec = {
+                "prompt_idx": pi,
+                "label": label,
+                "inject_layer": l,
+                "probe_idx": pidx,
+                "gain1": gain1.detach().cpu(),
+                "gain2": gain2.detach().cpu(),
+                "noise": noise_scalar,
+                "nonlinear_residual": nonlinear_residual.detach().cpu(),
+                "max_resp_layer": max_resp_layer,
+                "final_gain": final_gain,
+                "active_layer_count": active_layer_count,
+                "flip": flip1,
+                "top_idx1": top_idx1.detach().cpu().to(torch.int32),
+                "top_val1": top_val1.detach().cpu(),
+            }
+
+            if SAVE_FULL_DELTA:
+                rec["delta1"] = delta1.detach().cpu()
+                rec["delta2"] = delta2.detach().cpu()
+
+            records.append(rec)
+
+            if pidx == 0:
+                print(
+                    f"{label:<10}{l:<7}{pidx:<7}"
+                    f"{final_gain:<12.5f}{max_resp_layer:<10}"
+                    f"{noise_scalar:<10.5f}{'🔴' if flip1 else '🟢'}"
+                )
+
+        # Optional progress per layer
+        # print(f"   finished inject layer {l}")
+
+# Turn off probing
+PROBE_STATE["active_layer"] = None
+PROBE_STATE["u"] = None
+
+# Remove hooks
+for h in hooks:
+    h.remove()
+
+print(f"\n✅ Sonar sweep done ({time.time()-t0:.1f}s)")
+
+# ------------------------------------------------------------
+# 6. LAYER-LEVEL SUMMARY
+# ------------------------------------------------------------
+print("\n" + "=" * 80)
+print("📊 LAYER SONAR SUMMARY")
+print("=" * 80)
+print(
+    f"{'InjectLayer':<13}{'AvgFinalGain':<15}{'AvgMaxResp':<13}"
+    f"{'AvgNoise':<12}{'AvgBreadth':<13}{'FlipRate%'}"
+)
+print("-" * 80)
+
+layer_stats = []
+
+for l in range(NL):
+    rs = [r for r in records if r["inject_layer"] == l]
+    if not rs:
+        continue
+
+    avg_final_gain = float(np.mean([r["final_gain"] for r in rs]))
+    avg_max_resp = float(np.mean([r["max_resp_layer"] for r in rs]))
+    avg_noise = float(np.mean([r["noise"] for r in rs]))
+    avg_breadth = float(np.mean([r["active_layer_count"] for r in rs]))
+    flip_rate = float(np.mean([r["flip"] for r in rs]) * 100.0)
+
+    layer_stats.append((l, avg_final_gain, avg_max_resp, avg_noise, avg_breadth, flip_rate))
+
+    print(
+        f"{l:<13}{avg_final_gain:<15.5f}{avg_max_resp:<13.2f}"
+        f"{avg_noise:<12.5f}{avg_breadth:<13.2f}{flip_rate:.1f}"
+    )
+
+# ------------------------------------------------------------
+# 7. TOP PATHS: HIGHWAYS, NOISY TUNNELS, LONG-RANGE PATHS
+# ------------------------------------------------------------
+if layer_stats:
+    by_gain = sorted(layer_stats, key=lambda x: x[1], reverse=True)
+    by_noise = sorted(layer_stats, key=lambda x: x[3], reverse=True)
+    by_delay = sorted(layer_stats, key=lambda x: abs(x[2] - x[0]), reverse=True)
+    by_breadth = sorted(layer_stats, key=lambda x: x[4], reverse=True)
+
+    print("\n🛣️ TOP WIDE HIGHWAYS (highest final gain):")
+    for l, g, mr, n, b, fr in by_gain[:5]:
+        print(f"   Inject L{l:02d} -> final gain {g:.5f}, max response ~L{mr:.1f}, noise {n:.5f}")
+
+    print("\n🌀 TOP NOISY / NON-LINEAR TUNNELS:")
+    for l, g, mr, n, b, fr in by_noise[:5]:
+        print(f"   Inject L{l:02d} -> noise {n:.5f}, final gain {g:.5f}")
+
+    print("\n📏 TOP LONG-RANGE PATHS (largest delay):")
+    for l, g, mr, n, b, fr in by_delay[:5]:
+        print(f"   Inject L{l:02d} -> max response L{mr:.1f}, delay {abs(mr-l):.1f} layers")
+
+    print("\n🌐 TOP BROAD/FAN-OUT PATHS:")
+    for l, g, mr, n, b, fr in by_breadth[:5]:
+        print(f"   Inject L{l:02d} -> active response layers {b:.2f}, final gain {g:.5f}")
+
+# ------------------------------------------------------------
+# 8. IDENTITY FINGERPRINT CHECK
+#    Do France/Japan/Mexico produce different full sonar fingerprints?
+# ------------------------------------------------------------
+print("\n" + "=" * 80)
+print("🧩 IDENTITY SONAR FINGERPRINT CHECK")
+print("=" * 80)
+
+features = []
+feature_labels = []
+
+for pi, base in enumerate(baselines):
+    rs = [r for r in records if r["prompt_idx"] == pi]
+
+    # Flatten all gain1 vectors: inject_layer × probe × response_layer
+    feat = torch.cat([r["gain1"] for r in rs], dim=0)
+    feat = F.normalize(feat.unsqueeze(0), dim=1).squeeze(0)
+
+    features.append(feat)
+    feature_labels.append(base["prompt"])
+
+print(f"{'Pair':<48}{'CosineDist':<14}{'Verdict'}")
+print("-" * 80)
+
+pair_distances = []
+
+for i in range(len(features)):
+    for j in range(i + 1, len(features)):
+        cos = float(torch.dot(features[i], features[j]).item())
+        dist = 1.0 - cos
+        pair_distances.append(dist)
+
+        if dist < 0.005:
+            verdict = "⚪ VERY SIMILAR"
+        elif dist < 0.02:
+            verdict = "🟡 CLOSE"
+        elif dist < 0.05:
+            verdict = "🟠 MODERATE"
+        else:
+            verdict = "🟢 SEPARABLE"
+
+        pair = f"{feature_labels[i][:22]} vs {feature_labels[j][:22]}"
+        print(f"{pair:<48}{dist:<14.6f}{verdict}")
+
+# ------------------------------------------------------------
+# 9. SAVE FULL SONAR ARTIFACT
+# ------------------------------------------------------------
+os.makedirs("results", exist_ok=True)
+sonar_file = "results/mission_1_18_full_sonar_map.npz"
+
+inject_layer_arr = np.array([r["inject_layer"] for r in records], dtype=np.int16)
+probe_idx_arr = np.array([r["probe_idx"] for r in records], dtype=np.int16)
+prompt_idx_arr = np.array([r["prompt_idx"] for r in records], dtype=np.int16)
+
+gain1_arr = np.stack([r["gain1"].numpy() for r in records], axis=0).astype(np.float32)
+gain2_arr = np.stack([r["gain2"].numpy() for r in records], axis=0).astype(np.float32)
+noise_arr = np.array([r["noise"] for r in records], dtype=np.float32)
+max_resp_arr = np.array([r["max_resp_layer"] for r in records], dtype=np.int16)
+final_gain_arr = np.array([r["final_gain"] for r in records], dtype=np.float32)
+active_count_arr = np.array([r["active_layer_count"] for r in records], dtype=np.int16)
+flip_arr = np.array([r["flip"] for r in records], dtype=np.int8)
+
+top_idx_arr = np.stack([r["top_idx1"].numpy() for r in records], axis=0).astype(np.int32)
+top_val_arr = np.stack([r["top_val1"].numpy() for r in records], axis=0).astype(np.float32)
+
+prompt_labels_arr = np.array([base["prompt"] for base in baselines], dtype=object)
+
+save_dict = {
+    "inject_layer": inject_layer_arr,
+    "probe_idx": probe_idx_arr,
+    "prompt_idx": prompt_idx_arr,
+    "gain1": gain1_arr,
+    "gain2": gain2_arr,
+    "noise": noise_arr,
+    "max_resp_layer": max_resp_arr,
+    "final_gain": final_gain_arr,
+    "active_layer_count": active_count_arr,
+    "flip": flip_arr,
+    "top_idx": top_idx_arr,
+    "top_val": top_val_arr,
+    "prompt_labels": prompt_labels_arr,
+    "config": np.array([
+        MODEL_NAME,
+        str(PROBES_PER_LAYER),
+        str(EPS1),
+        str(EPS2),
+        PROBE_MODE,
+    ], dtype=object),
+}
+
+if SAVE_FULL_DELTA:
+    # Save as float16 to keep file size reasonable
+    delta1_arr = np.stack([r["delta1"].numpy() for r in records], axis=0).astype(np.float16)
+    delta2_arr = np.stack([r["delta2"].numpy() for r in records], axis=0).astype(np.float16)
+    save_dict["delta1"] = delta1_arr
+    save_dict["delta2"] = delta2_arr
+
+np.savez_compressed(sonar_file, **save_dict)
+
+size_kb = os.path.getsize(sonar_file) / 1024
+print("\n" + "=" * 80)
+print(f"💾 Full sonar map saved: {sonar_file}")
+print(f"📦 Size: {size_kb:.2f} KB")
+print("=" * 80)
+
+# ------------------------------------------------------------
+# 10. FINAL VERDICT
+# ------------------------------------------------------------
+avg_noise = float(np.mean([r["noise"] for r in records]))
+avg_flip = float(np.mean([r["flip"] for r in records]) * 100.0)
+avg_pair_dist = float(np.mean(pair_distances)) if pair_distances else 0.0
+
+print("\n🏆 MISSION 1.18 VERDICT")
+print("-" * 80)
+print(f"Average non-linear noise       : {avg_noise:.6f}")
+print(f"Average top-1 flip rate        : {avg_flip:.2f}%")
+print(f"Average identity fingerprint dist: {avg_pair_dist:.6f}")
+
+print("\nInterpretation:")
+if avg_flip < 15 and avg_noise < 0.03:
+    print("✅ Model locally quite stable under these probe scales.")
+    print("   Sonar map is reliable for identifying important routing paths.")
+elif avg_flip < 40:
+    print("🟡 Moderate non-linearity / sensitivity.")
+    print("   More probes or smaller EPS may improve map stability.")
+else:
+    print("🔴 High sensitivity / probe too strong or model very non-linear at this scale.")
+    print("   Reduce EPS1/EPS2 or increase PROBES_PER_LAYER with smaller amplitude.")
+
+if avg_pair_dist > 0.02:
+    print("🟢 Concept paths are separable in original model sonar fingerprint.")
+    print("   France/Japan/Mexico use distinguishable internal routing patterns.")
+elif avg_pair_dist > 0.005:
+    print("🟡 Concept paths are partially separable.")
+    print("   Need more probes or layer-focused identity subspace mapping.")
+else:
+    print("🔴 Concept paths are very similar in this probe map.")
+    print("   May need concept-aligned probes instead of random probes.")
+
+print("\n💡 NEXT STEP:")
+print("   Use this sonar map to build Routing-Aware DNA:")
+print("   - High-gain identity paths -> preserve")
+print("   - Low-behavior high-variance paths -> compress")
+print("   - Noisy non-linear tunnels -> handle carefully / distill")
+
+print(f"\n⏱️ Total time: {time.time()-t0:.1f}s")
+
+# Cleanup
+del model
+gc.collect() ================================================================================
+🧭 MISSION 1.18: FULL LAYER-WISE BROADBAND SONAR MAP
+================================================================================
+⚙️ Model: Qwen/Qwen2.5-0.5B-Instruct
+⚙️ Prompts: 3
+⚙️ Probes/layer: 4
+⚙️ Probe mode: coded
+⚙️ EPS scales: 0.01, 0.03
+⚙️ Save full delta: True
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+WARNING:huggingface_hub.utils._http:Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+config.json: 100% 659/659 [00:00<00:00, 33.4kB/s]model.safetensors: reconstructing file: 100%  988MB /  988MB, 77.8MB/s  model.safetensors: downloading bytes:   854MB, 64.2MB/s  Loading weights: 100% 290/290 [00:00<00:00, 341.06it/s]generation_config.json: 100% 242/242 [00:00<00:00, 10.1kB/s]tokenizer_config.json: 100% 7.30k/7.30k [00:00<00:00, 595kB/s]vocab.json: 100% 2.78M/2.78M [00:00<00:00, 33.8MB/s]merges.txt: 100% 1.67M/1.67M [00:00<00:00, 43.4MB/s]tokenizer.json: 100% 7.03M/7.03M [00:00<00:00, 88.2MB/s]✅ Model loaded | layers=24 | hidden_dim=896
+📡 Created random coded probes.
+ Approx forward passes: 576
+
+🧱 Running baselines...
+   [0] 'The capital of France is' | baseline top1 id=12095
+   [1] 'The capital of Japan is' | baseline top1 id=7407
+   [2] 'The capital of Mexico is' | baseline top1 id=7407
+✅ Baselines ready (16.2s)
+
+📡 Running full layer-wise sonar sweep...
+Prompt    Layer  Probe  FinalGain   MaxResp   Noise     Flip
+--------------------------------------------------------------------------------
+France    0      0      32.27540    23        0.49558   🟢
+France    1      0      6.94862     23        0.01061   🟢
+France    2      0      5.05541     23        0.00603   🟢
+France    3      0      7.10715     23        0.00429   🟢
+France    4      0      3.68475     23        0.00376   🟢
+France    5      0      8.31646     23        0.00333   🟢
+France    6      0      6.84219     23        0.00257   🟢
+France    7      0      4.52421     23        0.00248   🟢
+France    8      0      10.89272    23        0.00355   🟢
+France    9      0      8.22947     23        0.00349   🟢
+France    10     0      8.56792     23        0.00217   🟢
+France    11     0      10.55594    23        0.00227   🟢
+France    12     0      9.94357     23        0.00253   🟢
+France    13     0      6.49236     23        0.00198   🟢
+France    14     0      6.82112     23        0.00205   🟢
+France    15     0      8.52705     23        0.00155   🟢
+France    16     0      7.29882     23        0.00132   🟢
+France    17     0      6.65581     23        0.00121   🟢
+France    18     0      5.31692     23        0.00097   🟢
+France    19     0      5.13001     23        0.00080   🟢
+France    20     0      6.11228     23        0.00072   🟢
+France    21     0      5.13173     23        0.00066   🟢
+France    22     0      4.67620     23        0.00046   🟢
+France    23     0      4.00355     23        0.00030   🟢
+Japan     0      0      45.63388    23        0.52315   🟢
+Japan     1      0      8.41855     23        0.01103   🟢
+Japan     2      0      7.67039     23        0.00674   🟢
+Japan     3      0      7.25890     23        0.00427   🟢
+Japan     4      0      5.05102     23        0.00359   🟢
+Japan     5      0      8.95526     23        0.00318   🟢
+Japan     6      0      7.18260     23        0.00336   🟢
+Japan     7      0      7.28637     23        0.00282   🟢
+Japan     8      0      11.34697    23        0.00513   🟢
+Japan     9      0      8.02162     23        0.00284   🟢
+Japan     10     0      6.98521     23        0.00293   🟢
+Japan     11     0      11.67649    23        0.00271   🟢
+Japan     12     0      9.40136     23        0.00230   🟢
+Japan     13     0      7.08836     23        0.00240   🟢
+Japan     14     0      7.16982     23        0.00256   🟢
+Japan     15     0      9.66681     23        0.00214   🟢
+Japan     16     0      7.55486     23        0.00135   🟢
+Japan     17     0      7.58073     23        0.00117   🟢
+Japan     18     0      5.71137     23        0.00114   🟢
+Japan     19     0      5.46380     23        0.00090   🟢
+Japan     20     0      6.46417     23        0.00068   🟢
+Japan     21     0      5.39201     23        0.00060   🟢
+Japan     22     0      4.97654     23        0.00054   🟢
+Japan     23     0      4.12776     23        0.00033   🟢
+Mexico    0      0      36.94429    23        0.52076   🟢
+Mexico    1      0      7.44244     23        0.00939   🟢
+Mexico    2      0      5.14904     23        0.00572   🟢
+Mexico    3      0      6.73598     23        0.00397   🟢
+Mexico    4      0      4.31522     23        0.00293   🟢
+Mexico    5      0      9.73732     23        0.00372   🟢
+Mexico    6      0      6.83773     23        0.00239   🟢
+Mexico    7      0      5.22633     23        0.00271   🟢
+Mexico    8      0      12.22614    23        0.00353   🟢
+Mexico    9      0      8.38058     23        0.00334   🟢
+Mexico    10     0      7.76666     23        0.00233   🟢
+Mexico    11     0      11.83827    23        0.00246   🟢
+Mexico    12     0      12.41292    23        0.00248   🟢
+Mexico    13     0      6.27111     23        0.00226   🟢
+Mexico    14     0      6.97836     23        0.00197   🟢
+Mexico    15     0      9.46943     23        0.00197   🟢
+Mexico    16     0      8.48038     23        0.00141   🟢
+Mexico    17     0      7.36326     23        0.00124   🟢
+Mexico    18     0      5.81859     23        0.00109   🟢
+Mexico    19     0      5.66334     23        0.00092   🟢
+Mexico    20     0      6.46674     23        0.00084   🟢
+Mexico    21     0      5.52034     23        0.00066   🟢
+Mexico    22     0      5.03897     23        0.00051   🟢
+Mexico    23     0      4.34576     23        0.00031   🟢
+
+✅ Sonar sweep done (253.7s)
+
+================================================================================
+📊 LAYER SONAR SUMMARY
+================================================================================
+InjectLayer  AvgFinalGain   AvgMaxResp   AvgNoise    AvgBreadth   FlipRate%
+--------------------------------------------------------------------------------
+0            49.58405       23.00        0.62756     24.00        0.0
+1            8.88141        23.00        0.00785     23.00        0.0
+2            8.94082        23.00        0.00590     22.00        0.0
+3            7.22254        23.00        0.00492     21.00        0.0
+4            6.24865        23.00        0.00360     20.00        0.0
+5            6.46067        23.00        0.00379     19.00        0.0
+6            6.82502        23.00        0.00286     18.00        0.0
+7            7.29900        23.00        0.00254     17.00        0.0
+8            8.75531        23.00        0.00352     16.00        0.0
+9            8.49706        23.00        0.00287     15.00        0.0
+10           8.57393        23.00        0.00347     14.00        0.0
+11           8.76653        23.00        0.00256     13.00        0.0
+12           10.42926       23.00        0.00238     12.00        0.0
+13           8.11943        23.00        0.00220     11.00        0.0
+14           8.83357        23.00        0.00219     10.00        0.0
+15           7.76518        23.00        0.00172     9.00         0.0
+16           7.55364        23.00        0.00132     8.00         0.0
+17           7.02590        23.00        0.00120     7.00         0.0
+18           6.47192        23.00        0.00106     6.00         0.0
+19           5.62097        23.00        0.00091     5.00         0.0
+20           6.11146        23.00        0.00080     4.00         0.0
+21           5.06295        23.00        0.00063     3.00         0.0
+22           4.76571        23.00        0.00049     2.00         0.0
+23           4.16941        23.00        0.00033     1.00         0.0
+
+🛣️ TOP WIDE HIGHWAYS (highest final gain):
+   Inject L00 -> final gain 49.58405, max response ~L23.0, noise 0.62756
+   Inject L12 -> final gain 10.42926, max response ~L23.0, noise 0.00238
+   Inject L02 -> final gain 8.94082, max response ~L23.0, noise 0.00590
+   Inject L01 -> final gain 8.88141, max response ~L23.0, noise 0.00785
+   Inject L14 -> final gain 8.83357, max response ~L23.0, noise 0.00219
+
+🌀 TOP NOISY / NON-LINEAR TUNNELS:
+   Inject L00 -> noise 0.62756, final gain 49.58405
+   Inject L01 -> noise 0.00785, final gain 8.88141
+   Inject L02 -> noise 0.00590, final gain 8.94082
+   Inject L03 -> noise 0.00492, final gain 7.22254
+   Inject L05 -> noise 0.00379, final gain 6.46067
+
+📏 TOP LONG-RANGE PATHS (largest delay):
+   Inject L00 -> max response L23.0, delay 23.0 layers
+   Inject L01 -> max response L23.0, delay 22.0 layers
+   Inject L02 -> max response L23.0, delay 21.0 layers
+   Inject L03 -> max response L23.0, delay 20.0 layers
+   Inject L04 -> max response L23.0, delay 19.0 layers
+
+🌐 TOP BROAD/FAN-OUT PATHS:
+   Inject L00 -> active response layers 24.00, final gain 49.58405
+   Inject L01 -> active response layers 23.00, final gain 8.88141
+   Inject L02 -> active response layers 22.00, final gain 8.94082
+   Inject L03 -> active response layers 21.00, final gain 7.22254
+   Inject L04 -> active response layers 20.00, final gain 6.24865
+
+================================================================================
+🧩 IDENTITY SONAR FINGERPRINT CHECK
+================================================================================
+Pair                                            CosineDist    Verdict
+--------------------------------------------------------------------------------
+The capital of France  vs The capital of Japan i0.012959      🟡 CLOSE
+The capital of France  vs The capital of Mexico 0.009640      🟡 CLOSE
+The capital of Japan i vs The capital of Mexico 0.016299      🟡 CLOSE
+
+================================================================================
+💾 Full sonar map saved: results/mission_1_18_full_sonar_map.npz
+📦 Size: 11891.25 KB
+================================================================================
+
+🏆 MISSION 1.18 VERDICT
+--------------------------------------------------------------------------------
+Average non-linear noise       : 0.028612
+Average top-1 flip rate        : 0.00%
+Average identity fingerprint dist: 0.012966
+
+Interpretation:
+✅ Model locally quite stable under these probe scales.
+   Sonar map is reliable for identifying important routing paths.
+🟡 Concept paths are partially separable.
+   Need more probes or layer-focused identity subspace mapping.
+
+💡 NEXT STEP:
+   Use this sonar map to build Routing-Aware DNA:
+   - High-gain identity paths -> preserve
+   - Low-behavior high-variance paths -> compress
+   - Noisy non-linear tunnels -> handle carefully / distill
+
+⏱️ Total time: 254.5s
+0
