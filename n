@@ -1,0 +1,245 @@
+# ============================================================
+# 🧬 MISSION 1.13: NEAREST-NEIGHBOR CONCEPT BANK RESCUE
+# Oracle-free at inference: stored concept memory se DNA repair
+# ============================================================
+import torch, numpy as np, time, gc
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+t0 = time.time()
+print("="*72)
+print("🧬 MISSION 1.13: NEAREST-NEIGHBOR CONCEPT BANK RESCUE")
+print("="*72)
+
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    dtype=torch.float32,
+    low_cpu_mem_usage=True
+)
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+tok.padding_side = "left"
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+
+model.eval()
+NL = model.config.num_hidden_layers
+D = model.config.hidden_size
+
+W_unembed = model.get_output_embeddings().weight.detach().float()  # (vocab, D)
+print(f"✅ LM Head loaded: {tuple(W_unembed.shape)}")
+
+# ------------------------------------------------------------
+# 1. Calibration prompts -> DNA bases
+# ------------------------------------------------------------
+cal_prompts = [
+    "The capital of France is",
+    "The president of USA in 2009 was",
+    "The chemical symbol for gold is",
+    "The square root of 144 is",
+    "In Python, to sort a list you use",
+]
+
+cal_inp = tok(cal_prompts, return_tensors="pt", padding=True)
+cal_mask = cal_inp["attention_mask"].bool()
+
+boxes = {l: {} for l in range(NL)}
+CALIBRATING = True
+
+def make_cal_hook(l_idx):
+    def hook(m, i, o):
+        boxes[l_idx]['in'] = i[0].detach().float()
+        boxes[l_idx]['out'] = o.detach().float()
+        return o
+    return hook
+
+hooks_cal = [model.model.layers[l].register_forward_hook(make_cal_hook(l)) for l in range(NL)]
+with torch.no_grad():
+    model(**cal_inp)
+for h in hooks_cal:
+    h.remove()
+
+print("⏳ Precomputing Rank-16 DNA bases...")
+bases = {}
+for l in range(NL):
+    delta = boxes[l]['out'] - boxes[l]['in']
+    flat = delta.view(-1, D)[cal_mask.view(-1)].numpy()
+    mu = flat.mean(0)
+    _, _, Vt = np.linalg.svd(flat - mu, full_matrices=False)
+    bases[l] = (
+        torch.tensor(Vt[:16], dtype=torch.float32),
+        torch.tensor(mu, dtype=torch.float32)
+    )
+print(f"✅ DNA bases ready ({time.time()-t0:.1f}s)")
+
+# ------------------------------------------------------------
+# 2. DNA generation hook
+# ------------------------------------------------------------
+STATE = {"use_dna": False}
+
+def make_dna_hook(l_idx):
+    def hook(m, i, o):
+        if not STATE["use_dna"]:
+            return o
+        x = i[0].float()
+        delta = o.float() - x
+        fd = delta.view(-1, D)
+        Vk, mu = bases[l_idx]
+        proj = ((fd - mu) @ Vk.T) @ Vk + mu
+        return (x + proj.view(o.shape)).to(o.dtype)
+    return hook
+
+hooks_dna = [model.model.layers[l].register_forward_hook(make_dna_hook(l)) for l in range(NL)]
+
+# ------------------------------------------------------------
+# 3. Build Concept Memory Bank
+# For each calibration prompt:
+#   - generate few teacher tokens
+#   - store DNA hidden state -> original top-K logits
+# ------------------------------------------------------------
+K_BANK = 32
+bank_H = []
+bank_idx = []
+bank_val = []
+
+print("🧠 Building Concept Memory Bank from calibration trajectories...")
+
+for p in cal_prompts:
+    ids = tok(p, return_tensors="pt").input_ids
+
+    # Teacher-generated continuation, 4 tokens
+    STATE["use_dna"] = False
+    with torch.no_grad():
+        for _ in range(4):
+            out = model(ids)
+            nxt = out.logits[:, -1, :].argmax(-1, keepdim=True)
+            ids = torch.cat([ids, nxt], dim=-1)
+
+    # Original hidden states + logits
+    STATE["use_dna"] = False
+    with torch.no_grad():
+        out_orig = model(ids, output_hidden_states=True)
+        H_orig = out_orig.hidden_states[-1][0].float()       # (L, D)
+        logits_orig = out_orig.logits[0].float()             # (L, vocab)
+
+    # DNA hidden states
+    STATE["use_dna"] = True
+    with torch.no_grad():
+        out_dna = model(ids, output_hidden_states=True)
+        H_dna = out_dna.hidden_states[-1][0].float()         # (L, D)
+
+    L = ids.shape[1]
+    for i in range(L - 1):
+        bank_H.append(H_dna[i])
+        tk = torch.topk(logits_orig[i], K_BANK)
+        bank_idx.append(tk.indices)
+        bank_val.append(tk.values)
+
+bank_H = torch.stack(bank_H)        # (N, D)
+bank_idx = torch.stack(bank_idx)    # (N, K_BANK)
+bank_val = torch.stack(bank_val)    # (N, K_BANK)
+bank_H_norm = F.normalize(bank_H, dim=1)
+
+print(f"✅ Concept Bank ready: {bank_H.shape[0]} stored states")
+print(f"⏱️ Bank build time: {time.time()-t0:.1f}s")
+
+# ------------------------------------------------------------
+# 4. Inference: Nearest-neighbor concept rescue
+# ------------------------------------------------------------
+test_prompt = "The capital of Japan is"   # not directly in calibration
+ids = tok(test_prompt, return_tensors="pt").input_ids
+
+STEPS = 5
+K_DNA = 8
+
+print(f"\n🔍 UNSEEN PROMPT: '{test_prompt}'")
+print(f"{'Step':<5}{'Context':<14}{'Original Top-2':<32}{'DNA+Bank Rescue':<32}{'Match':<8}{'NN Sim'}")
+print("-" * 105)
+
+for step in range(STEPS):
+    # ---------- DNA current state ----------
+    STATE["use_dna"] = True
+    with torch.no_grad():
+        out_dna = model(ids, output_hidden_states=True)
+        h = out_dna.hidden_states[-1][0, -1].float()       # (D,)
+        logits_dna = out_dna.logits[0, -1].float()         # (vocab,)
+
+    # ---------- retrieve nearest concept bank entry ----------
+    hn = F.normalize(h.unsqueeze(0), dim=1)                # (1,D)
+    sims = (bank_H_norm @ hn.T).squeeze(1)                 # (N,)
+    j = int(torch.argmax(sims).item())
+    nn_sim = float(sims[j].item())
+
+    ret_idx = bank_idx[j]                                  # (K_BANK,)
+    ret_val = bank_val[j]                                  # (K_BANK,)
+
+    # ---------- choose directions: retrieved top-K + DNA top-K ----------
+    dna_top = torch.topk(logits_dna, K_DNA)
+    union = torch.unique(torch.cat([ret_idx, dna_top.indices]))
+
+    # ---------- build target logits for union ----------
+    # Retrieved indices get original teacher values.
+    # DNA-only high indices get suppressed below min retrieved value.
+    min_ret = float(ret_val.min().item())
+    target = torch.full((union.numel(),), min_ret - 10.0, dtype=torch.float32)
+
+    for ri, rv in zip(ret_idx.tolist(), ret_val.tolist()):
+        pos = torch.where(union == ri)[0]
+        if pos.numel() > 0:
+            target[pos[0]] = float(rv)
+
+    # ---------- minimum-norm hidden correction ----------
+    W_top = W_unembed[union]                               # (k,D)
+    WWT = W_top @ W_top.T                                  # (k,k)
+    WWT = WWT + 1e-3 * torch.eye(WWT.shape[0], dtype=WWT.dtype)
+    pinv = torch.linalg.pinv(WWT)
+
+    cur = h @ W_top.T                                      # (k,)
+    corr = W_top.T @ (pinv @ (target - cur))               # (D,)
+    h_corr = h + corr
+
+    # rescued logits directly from corrected hidden state
+    logits_res = h_corr @ W_unembed.T
+    probs_res = F.softmax(logits_res, dim=-1)
+    top2_res = torch.topk(probs_res, 2)
+
+    # ---------- original ground truth for evaluation only ----------
+    STATE["use_dna"] = False
+    with torch.no_grad():
+        out_orig = model(ids)
+        probs_orig = F.softmax(out_orig.logits[0, -1].float(), dim=-1)
+        top2_orig = torch.topk(probs_orig, 2)
+
+    w_orig = [tok.decode([t]).strip() for t in top2_orig.indices]
+    p_orig = top2_orig.values * 100
+
+    w_res = [tok.decode([t]).strip() for t in top2_res.indices]
+    p_res = top2_res.values * 100
+
+    match = "🟢 YES" if top2_orig.indices[0] == top2_res.indices[0] else "🔴 FLIP"
+    ctx = "[PROMPT]" if step == 0 else repr(tok.decode([ids[0, -1].item()]).strip())
+
+    print(
+        f"{step:<5}{ctx:<14}"
+        f"{w_orig[0]}({p_orig[0]:.1f}%) {w_orig[1]}({p_orig[1]:.1f}%)".ljust(32)
+        +
+        f"{w_res[0]}({p_res[0]:.1f}%) {w_res[1]}({p_res[1]:.1f}%)".ljust(32)
+        + f"{match:<8}{nn_sim:.3f}"
+    )
+
+    # Teacher-forced next token for diagnostic stability
+    next_tok = top2_orig.indices[0].unsqueeze(0).unsqueeze(0)
+    ids = torch.cat([ids, next_tok], dim=-1)
+
+# cleanup
+for h in hooks_dna:
+    h.remove()
+
+print("="*72)
+print("🏆 VERDICT:")
+print("   Agar YES aaye: Concept Bank rescue kaam karta hai for in-distribution/near-calibration prompts.")
+print("   Agar FLIP aaye: Bank coverage kam hai, ya DNA state calibration manifold se door hai.")
+print("   Ye ab live teacher use nahi kar raha, sirf stored memory use kar raha hai.")
+print(f"⏱️ Time: {time.time()-t0:.1f}s")
+
+del model
+gc.collect()
