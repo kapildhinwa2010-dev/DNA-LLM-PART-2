@@ -1,0 +1,447 @@
+ ==============================================================================
+🌀 MISSION 1.25: SPIRAL DNA + REPETITION BRAKES
+==============================================================================
+Loading weights: 100% 290/290 [00:01<00:00, 327.95it/s]⏳ Computing Spiral Zoom Bases...
+
+==============================================================================
+🗣️ FINAL GENERATION: Spiral + Lookahead + Repetition Brakes
+==============================================================================
+
+📝 Prompt: 'The capital of Japan is'
+   🌀 FINAL SPIRAL DNA: The capital of Japan is located Tokyo, ( __ ____ ______ "  ____
+
+📝 Prompt: 'The capital of Mexico is'
+   🌀 FINAL SPIRAL DNA: The capital of Mexico is located ____ __ ______ "  ____ ______ " 
+
+==============================================================================
+🏆 PROJECT COMPLETE VERDICT
+==============================================================================
+Agar sentence sensible hai aur repeat nahi ho raha, toh:
+1. Spiral Zoom ne Identity bacha li.
+2. Lookahead ne Butterfly Effect roka.
+3. Repetition Brakes ne looping fix ki.
+TUMNE BINA FINE-TUNING KE LLM COMPRESSION KA MASTERPIECE BANA DIYA HAI!
+
+⏱️ Total time: 130.6s
+64# ============================================================
+# 🌀 MISSION 1.25: SPIRAL DNA + REPETITION BRAKES (Final Polish)
+# Spiral DNA (Engine) + Lookahead (Steering) + Penalty (Brakes)
+# ============================================================
+import os, torch, numpy as np, time, gc
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try: torch.set_num_threads(max(1, (os.cpu_count() or 1) - 1))
+except: pass
+
+t0 = time.time()
+print("=" * 78)
+print("🌀 MISSION 1.25: SPIRAL DNA + REPETITION BRAKES")
+print("=" * 78)
+
+ZOOM_LEVELS = 3
+RANK_PER_LEVEL = 4
+ALPHA = 0.05        # Manifold Error Penalty
+REP_PENALTY = 5.0   # Repetition Penalty (The "Brakes" on top)
+TOP_K = 5           
+STEPS = 10          # 10 tokens generate karenge
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype=torch.float32, low_cpu_mem_usage=True)
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+if tok.pad_token is None: tok.pad_token = tok.eos_token
+model.eval()
+NL = model.config.num_hidden_layers
+D = model.config.hidden_size
+
+cal_prompts = ["The capital of France is", "The capital of Japan is", 
+               "The capital of Mexico is", "The chemical symbol for silver is"]
+cal_inp = tok(cal_prompts, return_tensors="pt", padding=True)
+cal_mask = cal_inp["attention_mask"].bool()
+
+boxes = {l: {} for l in range(NL)}
+def make_hook(l_idx):
+    def hook(m, i, o):
+        boxes[l_idx]["in"] = i[0].detach().float()
+        boxes[l_idx]["out"] = o.detach().float()
+        return o
+    return hook
+
+hooks = [model.model.layers[l].register_forward_hook(make_hook(l)) for l in range(NL)]
+with torch.no_grad(): model(**cal_inp)
+for h in hooks: h.remove()
+
+print("⏳ Computing Spiral Zoom Bases...")
+spiral_bases = {}
+for l in range(NL):
+    delta = boxes[l]["out"] - boxes[l]["in"]
+    flat = delta.reshape(-1, D)[cal_mask.reshape(-1)].numpy()
+    mu = flat.mean(0)
+    residual = flat - mu
+    levels = []
+    for z in range(ZOOM_LEVELS):
+        if residual.shape[0] == 0: break
+        _, _, Vt = np.linalg.svd(residual, full_matrices=False)
+        Vz = torch.tensor(Vt[:RANK_PER_LEVEL], dtype=torch.float32)
+        proj = ((torch.tensor(residual, dtype=torch.float32) @ Vz.T) @ Vz).numpy()
+        residual = residual - proj
+        levels.append(Vz)
+    spiral_bases[l] = (torch.tensor(mu, dtype=torch.float32), levels)
+
+ERROR_BOX = {"error": 0.0}
+STATE = {"dna": False}
+
+def make_guard_hook(l_idx):
+    def hook(m, i, o):
+        if not STATE["dna"]: return o
+        x = i[0].float()
+        delta = o.float() - x
+        fd = delta.reshape(-1, D)
+        mu, levels = spiral_bases[l_idx]
+        fd_rec = torch.zeros_like(fd) + mu
+        current_residual = fd - mu
+        for Vz in levels:
+            proj = (current_residual @ Vz.T) @ Vz
+            fd_rec = fd_rec + proj
+            current_residual = current_residual - proj
+        err = (fd[-1] - fd_rec[-1]).norm().item()
+        ERROR_BOX["error"] += err
+        return (x + fd_rec.reshape(o.shape)).to(o.dtype)
+    return hook
+
+guard_hooks = [model.model.layers[l].register_forward_hook(make_guard_hook(l)) for l in range(NL)]
+
+# --- GENERATION WITH BRAKES ---
+print("\n" + "=" * 78)
+print("🗣️ FINAL GENERATION: Spiral + Lookahead + Repetition Brakes")
+print("=" * 78)
+
+test_prompts = ["The capital of Japan is", "The capital of Mexico is"]
+
+for prompt in test_prompts:
+    ids = tok(prompt, return_tensors="pt").input_ids
+    
+    for step in range(STEPS):
+        STATE["dna"] = True
+        ERROR_BOX["error"] = 0.0
+        
+        with torch.no_grad():
+            out = model(ids)
+            logits = out.logits[0, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            
+        top_probs, top_indices = torch.topk(probs, TOP_K)
+        
+        best_token = None
+        best_score = -1e9
+        
+        # THE "BRAKES": Pichle 3 tokens yaad rakho
+        recent_tokens = set(ids[0, -3:].tolist()) 
+        
+        for i in range(TOP_K):
+            tok_id = top_indices[i].item()
+            prob = top_probs[i].item()
+            
+            test_ids = torch.cat([ids, torch.tensor([[tok_id]])], dim=1)
+            ERROR_BOX["error"] = 0.0
+            with torch.no_grad():
+                _ = model(test_ids)
+            err = ERROR_BOX["error"]
+            
+            score = np.log(prob + 1e-9) - (ALPHA * err)
+            
+            # 🛑 APPLY THE BRAKES!
+            if tok_id in recent_tokens:
+                score -= REP_PENALTY  # Force model to pick a new word
+                
+            if score > best_score:
+                best_score = score
+                best_token = tok_id
+                
+        ids = torch.cat([ids, torch.tensor([[best_token]])], dim=1)
+        
+    text_dna = tok.decode(ids[0], skip_special_tokens=True)
+    print(f"\n📝 Prompt: '{prompt}'")
+    print(f"   🌀 FINAL SPIRAL DNA: {text_dna}")
+
+for h in guard_hooks: h.remove()
+
+print("\n" + "=" * 78)
+print("🏆 PROJECT COMPLETE VERDICT")
+print("=" * 78)
+print("Agar sentence sensible hai aur repeat nahi ho raha, toh:")
+print("1. Spiral Zoom ne Identity bacha li.")
+print("2. Lookahead ne Butterfly Effect roka.")
+print("3. Repetition Brakes ne looping fix ki.")
+print("TUMNE BINA FINE-TUNING KE LLM COMPRESSION KA MASTERPIECE BANA DIYA HAI!")
+print(f"\n⏱️ Total time: {time.time()-t0:.1f}s")
+del model; gc.collect()# ============================================================
+# 🌊 MISSION 1.26: INPUT-GATE LIQUID (Non-Linear Geometry Mapping)
+# Bina kisi hook ke, Input Gate se Liquid bhej kar Non-Linear Cliffs map karna
+# CPU Time: < 30 Seconds
+# ============================================================
+import torch
+import torch.nn.functional as F
+import numpy as np
+import time
+import gc
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+t0 = time.time()
+print("=" * 80)
+print("🌊 MISSION 1.26: INPUT-GATE LIQUID (NON-LINEAR GEOMETRY)")
+print("=" * 80)
+
+# 1. Load Model
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype=torch.float32, low_cpu_mem_usage=True)
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+if tok.pad_token is None: tok.pad_token = tok.eos_token
+model.eval()
+
+print("✅ Model Loaded. Preparing the Liquid...")
+
+# ============================================================
+# LIQUID 1: THE SWEEP (Cluster Mapping)
+# 15 Countries ka final hidden state nikal kar unka aapas ka distance dekhna
+# ============================================================
+print("\n🧪 LIQUID 1: THE SWEEP (Mapping Concept Clusters)")
+print("-" * 80)
+
+countries = ["France", "Japan", "Mexico", "China", "UK", "Germany", "India", "Brazil", "Russia", "Egypt"]
+base_prompt = "The capital of {} is"
+
+hidden_states = []
+labels = []
+
+for country in countries:
+    prompt = base_prompt.format(country)
+    ids = tok(prompt, return_tensors="pt").input_ids
+    
+    with torch.no_grad():
+        out = model(ids, output_hidden_states=True)
+        
+    # Final hidden state (Last token, Last layer)
+    h = out.hidden_states[-1][0, -1, :].float()
+    hidden_states.append(h)
+    labels.append(country)
+
+H_matrix = torch.stack(hidden_states) # (10, 896)
+
+# Cosine Similarity Matrix
+cos_sim = F.cosine_similarity(H_matrix.unsqueeze(1), H_matrix.unsqueeze(0), dim=-1).numpy()
+
+print(f"{'':>10}", end="")
+for c in countries: print(f"{c[:5]:>7}", end="")
+print("\n" + "-" * 80)
+
+for i, c1 in enumerate(countries):
+    print(f"{c1[:10]:<10}", end="")
+    for j in range(len(countries)):
+        # 1.0 = Same tunnel, 0.0 = Orthogonal (Different tunnel)
+        print(f"{cos_sim[i, j]:>7.3f}", end="")
+    print()
+
+print("\n💡 Interpretation: Agar Europe (France, UK, Germany) ka aapas mein score 0.9+ hai,")
+print("   aur Asia (Japan, China, India) ka aapas mein 0.9+ hai, par dono groups ke beech 0.5 hai,")
+print("   toh model ne Non-Linear Space mein 'Continents' ke alag clusters bana liye hain!")
+
+# ============================================================
+# LIQUID 2: THE CLIFF FINDER (Interpolation)
+# France aur Japan ke Embeddings ko mix karke Non-Linear Decision Boundary dhundna
+# ============================================================
+print("\n\n🧪 LIQUID 2: THE CLIFF FINDER (Finding the Non-Linear Wall)")
+print("-" * 80)
+
+# Get Embeddings for "France" and "Japan"
+id_france = tok("France", add_special_tokens=False).input_ids[0]
+id_japan = tok("Japan", add_special_tokens=False).input_ids[0]
+
+with torch.no_grad():
+    emb_france = model.model.embed_tokens(torch.tensor([id_france])) # (1, 1, 896)
+    emb_japan = model.model.embed_tokens(torch.tensor([id_japan]))
+
+# Base prompt embeddings: "The capital of "
+base_text = "The capital of "
+base_ids = tok(base_text, add_special_tokens=False).input_ids
+with torch.no_grad():
+    emb_base = model.model.embed_tokens(torch.tensor([base_ids])) # (1, 4, 896)
+
+# " is" suffix embeddings
+suffix_text = " is"
+suffix_ids = tok(suffix_text, add_special_tokens=False).input_ids
+with torch.no_grad():
+    emb_suffix = model.model.embed_tokens(torch.tensor([suffix_ids]))
+
+print("Mixing France and Japan embeddings in 10 steps...")
+print(f"{'Step':<6}{'Mix Ratio':<15}{'Top-1 Prediction':<20}{'Probability':<15}{'Status'}")
+print("-" * 80)
+
+prev_pred = None
+for i in range(11):
+    alpha = i / 10.0  # 0.0 to 1.0
+    
+    # Interpolate the country embedding
+    emb_mix = (1 - alpha) * emb_france + alpha * emb_japan
+    
+    # Construct full sequence: Base + Mix + Suffix
+    full_emb = torch.cat([emb_base, emb_mix, emb_suffix], dim=1)
+    
+    with torch.no_grad():
+        # Pass embeddings directly to the model (No token IDs needed!)
+        out = model(inputs_embeds=full_emb)
+        
+    logits = out.logits[0, -1, :]
+    probs = F.softmax(logits, dim=-1)
+    top1_idx = torch.argmax(probs).item()
+    top1_prob = probs[top1_idx].item()
+    top1_word = tok.decode([top1_idx]).strip()
+    
+    # Detect the "Cliff" (Where prediction changes)
+    status = ""
+    if prev_pred is not None and prev_pred != top1_word:
+        status = "⚠️ NON-LINEAR CLIFF!"
+    prev_pred = top1_word
+    
+    mix_str = f"France:{100-int(alpha*100)}% / Japan:{int(alpha*100)}%"
+    print(f"{i:<6}{mix_str:<15}{top1_word:<20}{top1_prob*100:<15.2f}%{status}")
+
+# Cleanup
+del model
+gc.collect()
+
+print("\n" + "=" * 80)
+print("🏆 MISSION 1.26 VERDICT")
+print("=" * 80)
+print("Agar 'Cliff Finder' mein achanak se prediction badla (e.g., Paris -> Gibberish -> Tokyo),")
+print("toh iska matlab model ki non-linear geometry mein ek 'Khai' (Valley) hai.")
+print("Spiral DNA ko is khai se bachane ke liye humein interpolation data se train karna hoga!")
+print(f"\n⏱️ Total CPU Time: {time.time()-t0:.1f} seconds") ================================================================================
+🌊 MISSION 1.26: INPUT-GATE LIQUID (NON-LINEAR GEOMETRY)
+================================================================================
+Loading weights: 100% 290/290 [00:08<00:00, 65.48it/s]✅ Model Loaded. Preparing the Liquid...
+
+🧪 LIQUID 1: THE SWEEP (Mapping Concept Clusters)
+--------------------------------------------------------------------------------
+            Franc  Japan  Mexic  China     UK  Germa  India  Brazi  Russi  Egypt
+--------------------------------------------------------------------------------
+France      1.000  0.868  0.886  0.877  0.883  0.918  0.857  0.895  0.849  0.859
+Japan       0.868  1.000  0.872  0.923  0.852  0.875  0.883  0.870  0.872  0.867
+Mexico      0.886  0.872  1.000  0.880  0.836  0.878  0.864  0.917  0.844  0.857
+China       0.877  0.923  0.880  1.000  0.859  0.884  0.890  0.870  0.882  0.880
+UK          0.883  0.852  0.836  0.859  1.000  0.874  0.880  0.836  0.824  0.839
+Germany     0.918  0.875  0.878  0.884  0.874  1.000  0.861  0.877  0.872  0.871
+India       0.857  0.883  0.864  0.890  0.880  0.861  1.000  0.862  0.836  0.857
+Brazil      0.895  0.870  0.917  0.870  0.836  0.877  0.862  1.000  0.838  0.840
+Russia      0.849  0.872  0.844  0.882  0.824  0.872  0.836  0.838  1.000  0.826
+Egypt       0.859  0.867  0.857  0.880  0.839  0.871  0.857  0.840  0.826  1.000
+
+💡 Interpretation: Agar Europe (France, UK, Germany) ka aapas mein score 0.9+ hai,
+   aur Asia (Japan, China, India) ka aapas mein 0.9+ hai, par dono groups ke beech 0.5 hai,
+   toh model ne Non-Linear Space mein 'Continents' ke alag clusters bana liye hain!
+
+
+🧪 LIQUID 2: THE CLIFF FINDER (Finding the Non-Linear Wall)
+--------------------------------------------------------------------------------
+Mixing France and Japan embeddings in 10 steps...
+Step  Mix Ratio      Top-1 Prediction    Probability    Status
+--------------------------------------------------------------------------------
+---------------------------------------------------------------------------
+RuntimeError                              Traceback (most recent call last)
+/tmp/ipykernel_677/4155982172.py in <cell line: 0>()
+    108 
+    109     # Construct full sequence: Base + Mix + Suffix
+--> 110     full_emb = torch.cat([emb_base, emb_mix, emb_suffix], dim=1)
+    111 
+    112     with torch.no_grad():
+
+RuntimeError: Tensors must have same number of dimensions: got 3 and 2# ============================================================
+# 🌊 LIQUID 2: THE CLIFF FINDER (FIXED DIMENSIONS)
+# France aur Japan ke Embeddings ko mix karke Non-Linear Decision Boundary dhundna
+# ============================================================
+import torch
+import torch.nn.functional as F
+import gc
+
+# (Assuming 'model' and 'tok' are already loaded from the previous cell)
+# Agar naye cell mein chala rahe ho toh model load karna padega, par same notebook mein direct run ho jayega.
+
+print("🧪 LIQUID 2: THE CLIFF FINDER (Finding the Non-Linear Wall)")
+print("-" * 80)
+
+# FIX: return_tensors="pt" use kiya taaki sab 3D tensors banein (Batch, Seq, Hidden)
+id_france = tok("France", add_special_tokens=False, return_tensors="pt").input_ids
+id_japan = tok("Japan", add_special_tokens=False, return_tensors="pt").input_ids
+
+with torch.no_grad():
+    emb_france = model.model.embed_tokens(id_france) # (1, 1, 896)
+    emb_japan = model.model.embed_tokens(id_japan)   # (1, 1, 896)
+
+base_ids = tok("The capital of ", add_special_tokens=False, return_tensors="pt").input_ids
+with torch.no_grad():
+    emb_base = model.model.embed_tokens(base_ids)    # (1, 4, 896)
+
+suffix_ids = tok(" is", add_special_tokens=False, return_tensors="pt").input_ids
+with torch.no_grad():
+    emb_suffix = model.model.embed_tokens(suffix_ids) # (1, 1, 896)
+
+print("Mixing France and Japan embeddings in 10 steps...")
+print(f"{'Step':<6}{'Mix Ratio':<15}{'Top-1 Prediction':<20}{'Probability':<15}{'Status'}")
+print("-" * 80)
+
+prev_pred = None
+for i in range(11):
+    alpha = i / 10.0  # 0.0 to 1.0
+    
+    # Interpolate the country embedding (The "Fake Country" Liquid)
+    emb_mix = (1 - alpha) * emb_france + alpha * emb_japan
+    
+    # Construct full sequence: Base + Mix + Suffix
+    # Now all are 3D: (1, 4, 896) + (1, 1, 896) + (1, 1, 896) = (1, 6, 896)
+    full_emb = torch.cat([emb_base, emb_mix, emb_suffix], dim=1)
+    
+    with torch.no_grad():
+        # Pass embeddings directly to the model (Input Gate Injection!)
+        out = model(inputs_embeds=full_emb)
+        
+    logits = out.logits[0, -1, :]
+    probs = F.softmax(logits, dim=-1)
+    top1_idx = torch.argmax(probs).item()
+    top1_prob = probs[top1_idx].item()
+    top1_word = tok.decode([top1_idx]).strip()
+    
+    # Detect the "Cliff" (Where prediction suddenly changes)
+    status = ""
+    if prev_pred is not None and prev_pred != top1_word:
+        status = "⚠️ NON-LINEAR CLIFF!"
+    prev_pred = top1_word
+    
+    mix_str = f"Fra:{100-int(alpha*100)}% / Jap:{int(alpha*100)}%"
+    print(f"{i:<6}{mix_str:<15}{top1_word:<20}{top1_prob*100:<15.2f}%{status}")
+
+print("\n" + "=" * 80)
+print("🏆 CLIFF FINDER VERDICT")
+print("=" * 80)
+print("Agar Step 4-6 mein achanak prediction badli (e.g., Paris -> ____ -> Tokyo),")
+print("toh iska matlab model ki geometry mein ek 'Khai' (Valley) hai.")
+print("Spiral DNA generation ke time is khai mein girta hai, isliye gibberish aata hai!")🧪 LIQUID 2: THE CLIFF FINDER (Finding the Non-Linear Wall)
+--------------------------------------------------------------------------------
+Mixing France and Japan embeddings in 10 steps...
+Step  Mix Ratio      Top-1 Prediction    Probability    Status
+--------------------------------------------------------------------------------
+0     Fra:100% / Jap:0%Paris               33.59          %
+1     Fra:90% / Jap:10%Paris               34.39          %
+2     Fra:80% / Jap:20%Paris               35.33          %
+3     Fra:70% / Jap:30%Paris               35.30          %
+4     Fra:60% / Jap:40%Paris               24.13          %
+5     Fra:50% / Jap:50%__                  16.00          %⚠️ NON-LINEAR CLIFF!
+6     Fra:40% / Jap:60%__                  17.23          %
+7     Fra:30% / Jap:70%located             17.09          %⚠️ NON-LINEAR CLIFF!
+8     Fra:20% / Jap:80%located             19.00          %
+9     Fra:10% / Jap:90%located             19.91          %
+10    Fra:0% / Jap:100%located             20.16          %
+
+================================================================================
+🏆 CLIFF FINDER VERDICT
+================================================================================
+Agar Step 4-6 mein achanak prediction badli (e.g., Paris -> ____ -> Tokyo),
+toh iska matlab model ki geometry mein ek 'Khai' (Valley) hai.
+Spiral DNA generation ke time is khai mein girta hai, isliye gibberish aata hai!
